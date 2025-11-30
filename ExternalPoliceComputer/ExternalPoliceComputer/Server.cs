@@ -15,14 +15,24 @@ namespace ExternalPoliceComputer {
         internal static void Start() {
             listener?.Close();
             RunServer = true;
+            
+            int port = Setup.SetupController.GetConfig().port;
+            int wsPort = port + 1; // WebSocket on port + 1
+            
             listener = new HttpListener();
-            listener.Prefixes.Add($"http://+:{Setup.SetupController.GetConfig().port}/");
+            listener.Prefixes.Add($"http://+:{port}/");
             listener.Start();
-            string fullIp = $"http://{GetLocalIPAddress()}:{Setup.SetupController.GetConfig().port}";
-            string fullName = $"http://{Environment.MachineName}:{Setup.SetupController.GetConfig().port}";
+            
+            // Start WebSocket server on port + 1
+            WebSocketHandler.StartWebSocketServer(wsPort);
+            
+            string fullIp = $"http://{GetLocalIPAddress()}:{port}";
+            string fullName = $"http://{Environment.MachineName}:{port}";
+            string wsInfo = $"WebSocket: ws://{GetLocalIPAddress()}:{wsPort}/ws";
             Game.DisplayNotification($"{Setup.SetupController.GetLanguage().inGame.listeningOnIpAddress}{fullIp}");
             Game.DisplayNotification($"{Setup.SetupController.GetLanguage().inGame.listeningOnIpAddress}{fullName}");
-            File.WriteAllText(Setup.SetupController.IpAddressesPath, $"{fullIp}\n{fullName}");
+            Log(wsInfo, true, LogSeverity.Info);
+            File.WriteAllText(Setup.SetupController.IpAddressesPath, $"{fullIp}\n{fullName}\n{wsInfo}");
 
             while (RunServer) {
                 try {
@@ -39,11 +49,9 @@ namespace ExternalPoliceComputer {
         }
 
         private static void HandleRequest(HttpListenerContext ctx) { 
-            if (ctx.Request.IsWebSocketRequest && ctx.Request.RawUrl == "/ws") {
-                WebSocketHandler.HandleWebSocket(ctx);
-                return;
-            }
-
+            // WebSocket requests are now handled by websocket-sharp server
+            // No need to check for WebSocket upgrade here
+            
             HttpListenerRequest req = ctx.Request;
             HttpListenerResponse res = ctx.Response;
 
@@ -59,9 +67,9 @@ namespace ExternalPoliceComputer {
             res.OutputStream.Close();
         }
 
-        internal static async void Stop() {
+        internal static void Stop() {
             RunServer = false;
-            await WebSocketHandler.CloseAllWebSockets();
+            WebSocketHandler.StopWebSocketServer();
             listener?.Stop();
         }
 

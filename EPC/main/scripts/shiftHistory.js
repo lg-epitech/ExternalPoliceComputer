@@ -51,7 +51,8 @@
   }
 })()
 
-const shiftHistoryWS = new WebSocket(`ws://${location.host}/ws`)
+const wsPort = parseInt(location.port) + 1
+const shiftHistoryWS = new WebSocket(`ws://${location.hostname}:${wsPort}/ws`)
 shiftHistoryWS.onopen = () => shiftHistoryWS.send('shiftHistoryUpdated')
 
 shiftHistoryWS.onmessage = (event) => {

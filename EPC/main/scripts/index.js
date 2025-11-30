@@ -13,7 +13,9 @@
   applyOfficerInformationToDOM(officerInformationData)
 })()
 
-const timeWS = new WebSocket(`ws://${location.host}/ws`)
+// WebSocket server runs on port + 1
+const wsPort = parseInt(location.port) + 1
+const timeWS = new WebSocket(`ws://${location.hostname}:${wsPort}/ws`)
 timeWS.onopen = () => timeWS.send('interval/time')
 
 let currentShift = null
@@ -154,7 +156,7 @@ timeWS.onclose = async () => {
   showNotification(language.index.notifications.webSocketOnClose, 'warning', -1)
 }
 
-const locationWS = new WebSocket(`ws://${location.host}/ws`)
+const locationWS = new WebSocket(`ws://${location.hostname}:${wsPort}/ws`)
 locationWS.onopen = () => locationWS.send('interval/playerLocation')
 
 locationWS.onmessage = async (event) => {
