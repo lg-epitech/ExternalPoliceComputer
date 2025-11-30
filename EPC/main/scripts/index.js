@@ -13,10 +13,12 @@
   applyOfficerInformationToDOM(officerInformationData)
 })()
 
-const timeSSE = new SSEClient('time')
+const timeWS = new WebSocket(`ws://${location.host}/ws`)
+timeWS.onopen = () => timeWS.send('interval/time')
+
 let currentShift = null
 
-timeSSE.onmessage = async (event) => {
+timeWS.onmessage = async (event) => {
   const config = await getConfig()
   const data = JSON.parse(event.data)
   const inGameDateArr = data.response.split(':')
@@ -38,13 +40,6 @@ timeSSE.onmessage = async (event) => {
     config.useInGameTime ? inGameDate : realDate
   )
 }
-
-timeSSE.onclose = async () => {
-  const language = await getLanguage()
-  showNotification(language.index.notifications.webSocketOnClose, 'warning', -1)
-}
-
-timeSSE.connect()
 
 document
   .querySelector('.overlay .settings .currentShift .buttonWrapper .startShift')
@@ -154,9 +149,15 @@ async function applyCurrentShiftToDOM(currentShift, currentDate) {
   }
 }
 
-const locationSSE = new SSEClient('playerLocation')
+timeWS.onclose = async () => {
+  const language = await getLanguage()
+  showNotification(language.index.notifications.webSocketOnClose, 'warning', -1)
+}
 
-locationSSE.onmessage = async (event) => {
+const locationWS = new WebSocket(`ws://${location.host}/ws`)
+locationWS.onopen = () => locationWS.send('interval/playerLocation')
+
+locationWS.onmessage = async (event) => {
   const location = JSON.parse(event.data).response
   const icon = document.querySelector('.iconAccess .location').innerHTML
   document.querySelector(
@@ -164,12 +165,10 @@ locationSSE.onmessage = async (event) => {
   ).innerHTML = `${icon} ${location.Postal} ${location.Street},<br>${location.Area}`
 }
 
-locationSSE.onclose = async () => {
+locationWS.onclose = async () => {
   const language = await getLanguage()
   showNotification(language.index.notifications.webSocketOnClose, 'warning', -1)
 }
-
-locationSSE.connect()
 
 const desktopItems = document.querySelectorAll('.desktop .desktopItem')
 

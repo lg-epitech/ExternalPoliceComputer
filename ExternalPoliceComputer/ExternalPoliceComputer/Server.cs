@@ -39,8 +39,8 @@ namespace ExternalPoliceComputer {
         }
 
         private static void HandleRequest(HttpListenerContext ctx) { 
-            if (ctx.Request.RawUrl.StartsWith("/sse/")) {
-                SSEHandler.HandleSSE(ctx);
+            if (ctx.Request.IsWebSocketRequest && ctx.Request.RawUrl == "/ws") {
+                WebSocketHandler.HandleWebSocket(ctx);
                 return;
             }
 
@@ -59,9 +59,9 @@ namespace ExternalPoliceComputer {
             res.OutputStream.Close();
         }
 
-        internal static void Stop() {
+        internal static async void Stop() {
             RunServer = false;
-            SSEHandler.CloseAllConnections();
+            await WebSocketHandler.CloseAllWebSockets();
             listener?.Stop();
         }
 
