@@ -51,10 +51,11 @@
   }
 })()
 
-const shiftHistoryWS = new WebSocket(`ws://${location.host}/ws`)
-shiftHistoryWS.onopen = () => shiftHistoryWS.send('shiftHistoryUpdated')
+const shiftHistorySSE = new SSEClient('shiftHistoryUpdated')
 
-shiftHistoryWS.onmessage = (event) => {
+shiftHistorySSE.onmessage = (event) => {
   if (JSON.parse(event.data).response == 'Shift history updated')
     location.reload()
 }
+
+shiftHistorySSE.connect()

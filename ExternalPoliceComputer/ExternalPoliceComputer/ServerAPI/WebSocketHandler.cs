@@ -3,150 +3,177 @@ using ExternalPoliceComputer.Setup;
 using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Net;
-using System.Net.WebSockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using static ExternalPoliceComputer.Utility.Helper;
 
 namespace ExternalPoliceComputer.ServerAPI {
-    internal class WebSocketHandler {
-        private static readonly List<WebSocket> WebSockets = new List<WebSocket>();
-        private static readonly object WebSocketLock = new Object();
-        private static readonly Dictionary<WebSocket, CancellationTokenSource> IntervalTokens = new Dictionary<WebSocket, CancellationTokenSource>();
+    internal class SSEHandler {
+        private class SSEClient {
+            public HttpListenerResponse Response { get; set; }
+            public StreamWriter Writer { get; set; }
+            public CancellationTokenSource CancellationToken { get; set; }
+            public string SubscriptionType { get; set; }
+            public int Id { get; set; }
+        }
 
-        internal static async void HandleWebSocket(HttpListenerContext ctx) {
+        private static readonly List<SSEClient> Clients = new List<SSEClient>();
+        private static readonly object ClientsLock = new object();
+        private static int nextClientId = 0;
+
+        private static string lastPlayerLocation = "";
+        private static string lastTime = "";
+
+        internal static void HandleSSE(HttpListenerContext ctx) {
             try {
-                HttpListenerWebSocketContext wsContext = await ctx.AcceptWebSocketAsync(null);
-                WebSocket webSocket = wsContext.WebSocket;
-                byte[] buffer = new byte[1024];
+                HttpListenerRequest req = ctx.Request;
+                HttpListenerResponse res = ctx.Response;
 
-                lock (WebSocketLock) {
-                    WebSockets.Add(webSocket);
+                string path = req.Url.AbsolutePath;
+                string subscriptionType = path.Replace("/sse/", "");
+
+                res.ContentType = "text/event-stream";
+                res.Headers.Add("Cache-Control", "no-cache");
+                res.Headers.Add("Connection", "keep-alive");
+                res.Headers.Add("Access-Control-Allow-Origin", "*");
+                res.StatusCode = 200;
+
+                StreamWriter writer = new StreamWriter(res.OutputStream, Encoding.UTF8) {
+                    AutoFlush = true
+                };
+
+                SSEClient client = new SSEClient {
+                    Response = res,
+                    Writer = writer,
+                    CancellationToken = new CancellationTokenSource(),
+                    SubscriptionType = subscriptionType,
+                    Id = Interlocked.Increment(ref nextClientId)
+                };
+
+                lock (ClientsLock) {
+                    Clients.Add(client);
                 }
 
-                Log($"New WebSocket #{WebSockets.IndexOf(webSocket)}", true, LogSeverity.Info);
+                Log($"New SSE client #{client.Id} subscribed to: {subscriptionType}", true, LogSeverity.Info);
 
-                while (webSocket.State == WebSocketState.Open && Server.RunServer) {
-                    var result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+                SendInitialData(client);
 
-                    if (result.MessageType == WebSocketMessageType.Close) {
-                        lock (WebSocketLock) {
-                            WebSockets.Remove(webSocket);
-                            if (IntervalTokens.TryGetValue(webSocket, out var cts)) {
-                                cts.Cancel();
-                                IntervalTokens.Remove(webSocket);
-                            }
-                        }
-                        await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
+                if (subscriptionType == "shiftHistoryUpdated") {
+                    DataController.ShiftHistoryUpdated += () => OnShiftHistoryUpdated(client);
+                } else if (subscriptionType == "playerLocation" || subscriptionType == "time") {
+                    Task.Run(() => SendPeriodicUpdates(client), client.CancellationToken.Token);
+                }
+
+                while (Server.RunServer && !client.CancellationToken.Token.IsCancellationRequested) {
+                    Thread.Sleep(1000);
+                    if (!res.OutputStream.CanWrite) break;
+                }
+
+            } catch (HttpListenerException) {
+            } catch (Exception e) {
+                if (Server.RunServer) Log($"SSE Error: {e.Message}", true, LogSeverity.Error);
+            }
+        }
+
+        private static void SendInitialData(SSEClient client) {
+            try {
+                switch (client.SubscriptionType) {
+                    case "playerLocation":
+                        string locationData = JsonConvert.SerializeObject(DataController.PlayerLocation);
+                        SendEvent(client, locationData, "playerLocation");
+                        lastPlayerLocation = locationData;
                         break;
-                    }
-
-                    string clientMsg = Encoding.UTF8.GetString(buffer, 0, result.Count).Trim();
-
-                    if (clientMsg.StartsWith("interval/")) {
-                        string intervalMsg = clientMsg.Substring("interval/".Length);
-                        CancellationTokenSource cts = new CancellationTokenSource();
-                        lock (WebSocketLock) {
-                            IntervalTokens[webSocket] = cts;
-                        }
-                        await SendUpdatesOnInterval(webSocket, clientMsg.Substring("interval/".Length), cts.Token);
-                    } else {
-                        switch (clientMsg) {
-                            case "ping":
-                                await SendData(webSocket, "\"Pong!\"", clientMsg);
-                                break;
-                            case "shiftHistoryUpdated":
-                                DataController.ShiftHistoryUpdated += OnShiftHistoryUpdated;
-
-                                void OnShiftHistoryUpdated() {
-                                    if (webSocket.State != WebSocketState.Open || !Server.RunServer) return;
-                                    SendData(webSocket, "\"Shift history updated\"", "shiftHistoryUpdated").Wait();
-                                }
-                                break;
-                            default:
-                                await SendData(webSocket, $"\"Unknown command: '{clientMsg}'\"", clientMsg);
-                                break;
-                        }
-                    }
+                    case "time":
+                        string timeData = $"\"{DataController.CurrentTime}\"";
+                        SendEvent(client, timeData, "time");
+                        lastTime = timeData;
+                        break;
+                    case "ping":
+                        SendEvent(client, "\"Pong!\"", "ping");
+                        break;
                 }
             } catch (Exception e) {
-                if (Server.RunServer) Log($"WebSocket Error: {e.Message}", true, LogSeverity.Error);
-            } 
+                Log($"SSE initial data error: {e.Message}", true, LogSeverity.Warning);
+            }
         }
 
-        private static Task SendUpdatesOnInterval(WebSocket webSocket, string clientMsg, CancellationToken token) {
-            return Task.Run(async () => {
-                try {
-                    while (webSocket.State == WebSocketState.Open && Server.RunServer && !token.IsCancellationRequested) {
-                        string lastResponseMsg = "";
-                        string responseMsg;
-                        switch (clientMsg) {
-                            case "playerLocation":
-                                responseMsg = JsonConvert.SerializeObject(DataController.PlayerLocation);
+        private static async Task SendPeriodicUpdates(SSEClient client) {
+            try {
+                while (Server.RunServer && !client.CancellationToken.Token.IsCancellationRequested) {
+                    await Task.Delay(SetupController.GetConfig().webSocketUpdateInterval, client.CancellationToken.Token);
 
-                                if (responseMsg != lastResponseMsg) {
-                                    lastResponseMsg = responseMsg;
-                                    await SendData(webSocket, responseMsg, clientMsg, token);
-                                }
-                                break;
-                            case "time":
-                                responseMsg = $"\"{DataController.CurrentTime}\"";
-
-                                if (responseMsg != lastResponseMsg) {
-                                    lastResponseMsg = responseMsg;
-                                    await SendData(webSocket, responseMsg, clientMsg, token);
-                                }
-                                break;
-                            default:
-                                await SendData(webSocket, $"\"Unknown interval command: '{clientMsg}'\"", clientMsg, token);
-                                return;
-                        }
-
-                        await Task.Delay(SetupController.GetConfig().webSocketUpdateInterval, token);
+                    string responseMsg = "";
+                    switch (client.SubscriptionType) {
+                        case "playerLocation":
+                            responseMsg = JsonConvert.SerializeObject(DataController.PlayerLocation);
+                            if (responseMsg != lastPlayerLocation) {
+                                lastPlayerLocation = responseMsg;
+                                SendEvent(client, responseMsg, "playerLocation");
+                            }
+                            break;
+                        case "time":
+                            responseMsg = $"\"{DataController.CurrentTime}\"";
+                            if (responseMsg != lastTime) {
+                                lastTime = responseMsg;
+                                SendEvent(client, responseMsg, "time");
+                            }
+                            break;
                     }
-                } catch (OperationCanceledException) {
-                } catch (WebSocketException wse) when (wse.InnerException?.Message.Contains("nonexistent network connection") ?? false) {
-                    Log("WebSocket lost", true, LogSeverity.Warning);
-                } catch (Exception e) {
-                    string innerMessage = e.InnerException != null ? $"Inner: {e.InnerException.Message}" : "";
-                    Log($"WebSocket Error on interval: {e.Message}{innerMessage}", true, LogSeverity.Error);
                 }
-            });
+            } catch (OperationCanceledException) {
+            } catch (Exception e) {
+                if (Server.RunServer) Log($"SSE periodic update error: {e.Message}", true, LogSeverity.Warning);
+                RemoveClient(client);
+            }
         }
 
-        private static async Task SendData(WebSocket webSocket, string data, string clientMsg, CancellationToken token = default) {
-            string responseMsg = $"{{ \"response\": {data}, \"request\": \"{clientMsg}\" }}";
-
-            await webSocket.SendAsync(
-                new ArraySegment<byte>(Encoding.UTF8.GetBytes(responseMsg)),
-                WebSocketMessageType.Text,
-                true,
-                token
-            );
+        private static void OnShiftHistoryUpdated(SSEClient client) {
+            if (!Server.RunServer || client.CancellationToken.Token.IsCancellationRequested) return;
+            SendEvent(client, "\"Shift history updated\"", "shiftHistoryUpdated");
         }
 
-        internal static async Task CloseAllWebSockets() {
-            WebSocket[] webSocketsArr;
-            lock (WebSocketLock) {
-                foreach (var cts in IntervalTokens.Values) {
-                    cts.Cancel();
+        private static void SendEvent(SSEClient client, string data, string eventType) {
+            try {
+                if (!client.Response.OutputStream.CanWrite) {
+                    RemoveClient(client);
+                    return;
                 }
-                IntervalTokens.Clear();
 
-                webSocketsArr = WebSockets.ToArray();
-                WebSockets.Clear();
+                string message = $"event: {eventType}\ndata: {{\"response\": {data}, \"request\": \"{eventType}\"}}\n\n";
+                client.Writer.Write(message);
+            } catch (Exception e) {
+                Log($"SSE send error: {e.Message}", true, LogSeverity.Warning);
+                RemoveClient(client);
+            }
+        }
+
+        private static void RemoveClient(SSEClient client) {
+            lock (ClientsLock) {
+                if (Clients.Contains(client)) {
+                    Clients.Remove(client);
+                    Log($"SSE client #{client.Id} disconnected", true, LogSeverity.Info);
+                }
+            }
+        }
+
+        internal static void CloseAllConnections() {
+            SSEClient[] clientsArr;
+            lock (ClientsLock) {
+                clientsArr = Clients.ToArray();
+                Clients.Clear();
             }
 
-            foreach (WebSocket webSocket in webSocketsArr) {
+            foreach (SSEClient client in clientsArr) {
                 try {
-                    if (webSocket.State == WebSocketState.Open || webSocket.State == WebSocketState.CloseReceived) {
-                        Log($"Closing WebSocket #{Array.IndexOf(webSocketsArr, webSocket)}", true, LogSeverity.Info);
-                        await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
-                    }
+                    client.CancellationToken.Cancel();
+                    client.Writer?.Close();
+                    client.Response?.Close();
+                    Log($"Closing SSE client #{client.Id}", true, LogSeverity.Info);
                 } catch (Exception e) {
-                    Log($"WebSocket close error: {e.Message}", true, LogSeverity.Warning);
+                    Log($"SSE close error: {e.Message}", true, LogSeverity.Warning);
                 }
             }
         }
